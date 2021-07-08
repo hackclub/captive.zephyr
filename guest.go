@@ -3,15 +3,18 @@ package portal
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
+	"io"
 	"log"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
 	"strconv"
 	"time"
 )
@@ -37,12 +40,13 @@ func NewGuestHandler(username, password, unifiBaseURL string, tmpl *template.Tem
 }
 
 type guestHandler struct {
-	cl       *http.Client
-	tmpl     *template.Template
-	username string
-	password string
-	unifiURL *url.URL
-	nonces   nonceCache
+	cl        *http.Client
+	tmpl      *template.Template
+	username  string
+	password  string
+	unifiURL  *url.URL
+	nonces    nonceCache
+	csrfToken string
 }
 
 func (h *guestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -96,10 +100,12 @@ func (h *guestHandler) handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.loginUnifi(); err != nil {
-		log.Printf("Error logging in to UniFi: %v", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
+	if h.csrfToken == "" {
+		if err := h.loginUnifi(); err != nil {
+			log.Printf("Error logging in to UniFi: %v", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
 	}
 
 	if err := h.authorizeGuest(login); err != nil {
@@ -109,7 +115,7 @@ func (h *guestHandler) handlePost(w http.ResponseWriter, r *http.Request) {
 	}
 	defer delete(h.nonces, login.Key())
 
-	log.Printf("SUCCESSFUL login: redirect %q", login.Redirect)
+	log.Printf("SUCCESSFUL login: redirect %q", login.Redirect.String())
 	http.Redirect(w, r, login.Redirect.String(), http.StatusSeeOther)
 }
 
@@ -118,39 +124,54 @@ func (h *guestHandler) handleDefault(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *guestHandler) loginUnifi() error {
-	frm := loginForm{Username: h.username, Password: h.password, Strict: true}
+	//frm := loginForm{Username: h.username, Password: h.password, Strict: true}
+	frm := loginForm{Username: h.username, Password: h.password}
 	data, err := json.Marshal(frm)
 	if err != nil {
 		return err
 	}
 
-	loginURL, err := h.unifiURL.Parse("/api/login")
+	loginURL, err := h.unifiURL.Parse("/api/auth/login")
 	if err != nil {
 		return err
 	}
+
+	fmt.Println(h.unifiURL)
+	fmt.Println(loginURL)
+
 	req, err := http.NewRequest("POST", loginURL.String(), bytes.NewReader(data))
 	if err != nil {
 		return err
 	}
 
+	req.Header.Add("Content-Type", "application/json")
+
 	resp, err := h.cl.Do(req)
 	if err != nil {
 		return err
 	}
+	io.Copy(os.Stdout, resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return errors.New(fmt.Sprintf("not ok response: %v", resp.Status))
 	}
+
+	csrfToken := resp.Header.Get("X-CSRF-Token")
+
+	h.csrfToken = csrfToken
+
+	h.cl.Jar.SetCookies(resp.Request.URL, resp.Cookies())
+
 	return nil
 }
 
 func (h *guestHandler) authorizeGuest(login *guestLogin) error {
-	payload := cmd{Cmd: "authorize-guest", MAC: login.MAC, Minutes: 7 * 24 * 60}
+	payload := cmd{Cmd: "authorize-guest", MAC: login.MAC, Minutes: 60 * 8}
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
 
-	authURL, err := h.unifiURL.Parse("/api/s/default/cmd/stamgr")
+	authURL, err := h.unifiURL.Parse("/proxy/network/api/s/default/cmd/stamgr")
 	if err != nil {
 		return err
 	}
@@ -162,16 +183,21 @@ func (h *guestHandler) authorizeGuest(login *guestLogin) error {
 
 	req.Header.Add("content-type", "application/json;charset=UTF-8")
 
+	fmt.Println(h.cl.Jar.Cookies)
+
 	for _, cookie := range h.cl.Jar.Cookies(authURL) {
-		if cookie.Name == "csrf_token" {
-			req.Header.Add("x-csrf-token", cookie.Value)
-		}
+		req.AddCookie(cookie)
 	}
+
+	req.Header.Add("x-csrf-token", h.csrfToken)
+	fmt.Println(h.csrfToken)
 
 	resp, err := h.cl.Do(req)
 	if err != nil {
 		return err
 	}
+	fmt.Println(authURL.String())
+	io.Copy(os.Stdout, resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return errors.New(fmt.Sprintf("login: unexpected response: %v", resp.Status))
 	}
@@ -179,7 +205,7 @@ func (h *guestHandler) authorizeGuest(login *guestLogin) error {
 }
 
 func (h *guestHandler) listGuests() ([]guest, error) {
-	staURL, err := h.unifiURL.Parse("/api/s/default/stat/sta")
+	staURL, err := h.unifiURL.Parse("/api/s/default/stat/guest")
 	if err != nil {
 		return nil, err
 	}
@@ -207,8 +233,8 @@ func (h *guestHandler) listGuests() ([]guest, error) {
 type loginForm struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
-	Remember bool   `json:"remember"`
-	Strict   bool   `json:"strict"`
+	Remember bool   `json:"rememberMe"`
+	Strict   bool   `json:"strict,omitempty"`
 }
 
 type guestLogin struct {
@@ -278,7 +304,13 @@ func newClient() (*http.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &http.Client{Jar: jar}, nil
+
+	// skip https verification
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+
+	return &http.Client{Jar: jar, Transport: tr}, nil
 }
 
 func noCache(w http.ResponseWriter) {

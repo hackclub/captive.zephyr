@@ -17,9 +17,10 @@ var (
 	listen    = ":12380"
 	public    = "public"
 	templates = "templates"
-	user      = "ubnt"
-	pass      = "ubnt"
-	unifi     = "https://unifi:8443/"
+	user      = "zrl"
+	pass      = "Hunter2!"
+	unifi     = "https://10.10.8.1"
+	//unifi = "https://asdfawer.free.beeceptor.com"
 )
 
 func main() {

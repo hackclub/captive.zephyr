@@ -20,7 +20,6 @@ var (
 	user      = "zrl"
 	pass      = "Hunter2!"
 	unifi     = "https://10.10.8.1"
-	//unifi = "https://asdfawer.free.beeceptor.com"
 )
 
 func main() {

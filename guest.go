@@ -2,19 +2,15 @@ package portal
 
 import (
 	"bytes"
-	"crypto/rand"
 	"crypto/tls"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
-	"io"
 	"log"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
-	"os"
 	"strconv"
 	"time"
 )
@@ -35,7 +31,6 @@ func NewGuestHandler(username, password, unifiBaseURL string, tmpl *template.Tem
 		password: password,
 		unifiURL: base,
 		tmpl:     tmpl,
-		nonces:   nonceCache{},
 	}
 }
 
@@ -45,8 +40,8 @@ type guestHandler struct {
 	username  string
 	password  string
 	unifiURL  *url.URL
-	nonces    nonceCache
 	csrfToken string
+	authTime  time.Time
 }
 
 func (h *guestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -70,8 +65,6 @@ func (h *guestHandler) handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.nonces.Set(login.Key(), login.Nonce)
-
 	tmpl := h.tmpl.Lookup("default.html")
 	if tmpl == nil {
 		log.Printf("couldn't find template %q", "default.html")
@@ -94,13 +87,7 @@ func (h *guestHandler) handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !h.nonces.Valid(login.Key(), login.Nonce) {
-		log.Println("Missing valid nonce, possible bypass attempt")
-		http.Error(w, "suspicious login attempt", http.StatusUnauthorized)
-		return
-	}
-
-	if h.csrfToken == "" {
+	if h.csrfToken == "" || h.authTime.Before(time.Now().Add(-time.Minute)) {
 		if err := h.loginUnifi(); err != nil {
 			log.Printf("Error logging in to UniFi: %v", err)
 			http.Error(w, "internal error", http.StatusInternalServerError)
@@ -113,9 +100,11 @@ func (h *guestHandler) handlePost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	defer delete(h.nonces, login.Key())
 
 	log.Printf("SUCCESSFUL login: redirect %q", login.Redirect.String())
+
+	time.Sleep(1 * time.Second)
+
 	http.Redirect(w, r, login.Redirect.String(), http.StatusSeeOther)
 }
 
@@ -124,7 +113,6 @@ func (h *guestHandler) handleDefault(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *guestHandler) loginUnifi() error {
-	//frm := loginForm{Username: h.username, Password: h.password, Strict: true}
 	frm := loginForm{Username: h.username, Password: h.password}
 	data, err := json.Marshal(frm)
 	if err != nil {
@@ -136,8 +124,7 @@ func (h *guestHandler) loginUnifi() error {
 		return err
 	}
 
-	fmt.Println(h.unifiURL)
-	fmt.Println(loginURL)
+	h.cl.Jar, _ = cookiejar.New(nil) // clear cookies before auth
 
 	req, err := http.NewRequest("POST", loginURL.String(), bytes.NewReader(data))
 	if err != nil {
@@ -150,7 +137,6 @@ func (h *guestHandler) loginUnifi() error {
 	if err != nil {
 		return err
 	}
-	io.Copy(os.Stdout, resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return errors.New(fmt.Sprintf("not ok response: %v", resp.Status))
 	}
@@ -158,6 +144,7 @@ func (h *guestHandler) loginUnifi() error {
 	csrfToken := resp.Header.Get("X-CSRF-Token")
 
 	h.csrfToken = csrfToken
+	h.authTime = time.Now()
 
 	h.cl.Jar.SetCookies(resp.Request.URL, resp.Cookies())
 
@@ -183,21 +170,16 @@ func (h *guestHandler) authorizeGuest(login *guestLogin) error {
 
 	req.Header.Add("content-type", "application/json;charset=UTF-8")
 
-	fmt.Println(h.cl.Jar.Cookies)
-
 	for _, cookie := range h.cl.Jar.Cookies(authURL) {
 		req.AddCookie(cookie)
 	}
 
 	req.Header.Add("x-csrf-token", h.csrfToken)
-	fmt.Println(h.csrfToken)
 
 	resp, err := h.cl.Do(req)
 	if err != nil {
 		return err
 	}
-	fmt.Println(authURL.String())
-	io.Copy(os.Stdout, resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return errors.New(fmt.Sprintf("login: unexpected response: %v", resp.Status))
 	}
@@ -243,7 +225,6 @@ type guestLogin struct {
 	SSID     string
 	When     time.Time
 	Redirect *url.URL
-	Nonce    string
 }
 
 func (l guestLogin) Key() string {
@@ -265,22 +246,12 @@ func parseForm(r *http.Request) (*guestLogin, error) {
 		return nil, err
 	}
 
-	nonce := r.Form.Get("nonce")
-	if nonce == "" {
-		data := [128]byte{}
-		if _, err := rand.Read(data[:]); err != nil {
-			return nil, err
-		}
-		nonce = base64.StdEncoding.EncodeToString(data[:])
-	}
-
 	return &guestLogin{
 		MAC:      r.Form.Get("id"),
 		AP:       r.Form.Get("ap"),
 		SSID:     r.Form.Get("ssid"),
 		When:     time.Unix(when, 0),
 		Redirect: redir,
-		Nonce:    nonce,
 	}, nil
 }
 
@@ -323,52 +294,4 @@ type cmd struct {
 	Cmd     string `json:"cmd"`
 	MAC     string `json:"mac"`
 	Minutes int    `json:"minutes"`
-}
-
-type expireNonce struct {
-	nonce string
-	until int64
-}
-
-func newNonce(nonce string) expireNonce {
-	until := Clock.Unix(10 * time.Minute)
-	return expireNonce{nonce: nonce, until: until}
-}
-
-type nonceCache map[string][]expireNonce
-
-func (c nonceCache) Valid(key, val string) bool {
-	for _, n := range c.Get(key) {
-		if n == val {
-			return true
-		}
-	}
-	return false
-}
-
-func (c nonceCache) Get(key string) []string {
-	var nonces []string
-	var fresh []expireNonce
-	now := Clock.Unix(0)
-	if l, ok := c[key]; ok {
-		for _, n := range l {
-			if n.until > now {
-				nonces = append(nonces, n.nonce)
-				fresh = append(fresh, n)
-			}
-		}
-		c[key] = fresh
-	}
-	return nonces
-}
-
-func (c nonceCache) Set(key string, val string) {
-	nonce := newNonce(val)
-	c[key] = append(c[key], nonce)
-}
-
-func (c nonceCache) Purge() {
-	for k := range c {
-		c.Get(k)
-	}
 }
